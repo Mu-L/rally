@@ -377,9 +377,9 @@ class EsStoreType(Enum):
     ilm_default_resource: str
     data_stream_version: str
 
-    metrics = ("metrics", "v1")
-    results = ("results", "v1")
-    races = ("races", "v1")
+    metrics = ("metrics", "v2")
+    results = ("results", "v2")
+    races = ("races", "v2")
 
     def __new__(cls, metric_name, version):
         obj = object.__new__(cls)
@@ -988,8 +988,9 @@ class MetricsStore:  # pylint: disable=too-many-public-methods
         if relative_time is None:
             relative_time = self._stop_watch.split_time()
 
+        timestamp = time.to_epoch_millis(absolute_time)
         doc = {
-            "@timestamp": time.to_epoch_millis(absolute_time),
+            "@timestamp": timestamp,
             "relative-time": convert.seconds_to_ms(relative_time),
             "race-id": self._race_id,
             "race-timestamp": self._race_timestamp,
@@ -1003,6 +1004,8 @@ class MetricsStore:  # pylint: disable=too-many-public-methods
             "sample-type": sample_type.name.lower(),
             "meta": meta,
         }
+        if name == "service_time":
+            doc["response-timestamp"] = int(timestamp + value)
         if task:
             doc["task"] = task
         if operation:
@@ -1198,6 +1201,18 @@ class MetricsStore:  # pylint: disable=too-many-public-methods
         :param sample_type The sample type to query. Optional. By default, all samples are considered.
         :param cluster_name The name of the cluster (multi-cluster mode). Optional.
         :return: A metric_stats structure.
+        """
+        raise NotImplementedError("abstract method")
+
+    def get_op_window(self, task, name="service_time", sample_type=SampleType.Normal, cluster_name=None):
+        """
+        Earliest operation start and latest operation completion for a task.
+
+        :param task: The task name to query.
+        :param name: The metric name to query. Defaults to service_time.
+        :param sample_type: Warmup or Normal. Defaults to SampleType.Normal.
+        :param cluster_name: The name of the cluster (multi-cluster mode). Optional.
+        :return: ``(min @timestamp, max response-timestamp)`` in epoch milliseconds, or None if there are no matching samples.
         """
         raise NotImplementedError("abstract method")
 
@@ -1469,6 +1484,25 @@ class EsMetricsStore(MetricsStore):
         result = self._client.search(index=self._index_handler.index_name(self._race_timestamp), body=query)
         return result["aggregations"]["metric_stats"]
 
+    def get_op_window(self, task, name="service_time", sample_type=SampleType.Normal, cluster_name=None):
+        query = {
+            "query": self._query_by_name(name, task, None, sample_type, None, cluster_name),
+            "size": 0,
+            "aggs": {
+                "start": {"min": {"field": "@timestamp"}},
+                "end": {"max": {"field": "response-timestamp"}},
+            },
+        }
+        self.logger.debug(
+            "Issuing get_op_window against index=[%s], query=[%s]", self._index_handler.index_name(self._race_timestamp), query
+        )
+        result = self._client.search(index=self._index_handler.index_name(self._race_timestamp), body=query)
+        start = result["aggregations"]["start"]["value"]
+        end = result["aggregations"]["end"]["value"]
+        if start is None or end is None:
+            return None
+        return int(start), int(end)
+
     def task_cluster_names(self):
         query = {
             "query": {
@@ -1559,7 +1593,7 @@ class EsMetricsStore(MetricsStore):
                     },
                 },
             )
-        if sample_type:
+        if sample_type is not None:
             q["bool"]["filter"].append(
                 {
                     "term": {
@@ -1701,6 +1735,14 @@ class InMemoryMetricsStore(MetricsStore):
             }
         else:
             return None
+
+    def get_op_window(self, task, name="service_time", sample_type=SampleType.Normal, cluster_name=None):
+        # Every service_time sample carries a response-timestamp, so each doc
+        # yields a (start, end) pair. The list is only empty when the task/phase produced no samples.
+        windows = self._get(name, task, None, sample_type, None, cluster_name, lambda d: (d["@timestamp"], d["response-timestamp"]))
+        if not windows:
+            return None
+        return int(min(start for start, _ in windows)), int(max(end for _, end in windows))
 
     def task_cluster_names(self):
         return {
@@ -2009,9 +2051,9 @@ class Race:
             d["plugin-params"] = self.plugin_params
         return d
 
-    def to_result_dicts(self):
+    def result_doc_base(self):
         """
-        :return: a list of dicts, suitable for persisting the results of this race in a format that is Kibana-friendly.
+        :return: Metadata shared by every ``rally-results-*`` document for this race.
         """
         result_template = {
             "@timestamp": time.to_epoch_millis(self.race_timestamp.timestamp()),
@@ -2050,8 +2092,29 @@ class Race:
             result_template["target-auth-type"] = self.target_auth_type
         if self.meta_data:
             result_template["meta"] = self.meta_data
+        return result_template
 
+    def time_window_result_doc(self, task, operation, window):
+        doc = self.result_doc_base()
+        doc.update({"name": "time_window", "task": task, "operation": operation})
+        doc.update(window)
+        return doc
+
+    def to_result_dicts(self):
+        """
+        :return: a list of dicts, suitable for persisting the results of this race in a format that is Kibana-friendly.
+        """
+        result_template = self.result_doc_base()
         all_results = []
+        # Per-task wall-clock window fields copied from a reported op_metrics entry onto its own time_window doc.
+        time_window_fields = (
+            "start_timestamp",
+            "end_timestamp",
+            "warmup_start_timestamp",
+            "warmup_end_timestamp",
+            "normal_start_timestamp",
+            "normal_end_timestamp",
+        )
 
         results_list = self.results if isinstance(self.results, list) else [self.results]
         for stats in results_list:
@@ -2059,6 +2122,10 @@ class Race:
                 result = result_template.copy()
                 result.update(item)
                 all_results.append(result)
+            for op in getattr(stats, "op_metrics", None) or []:
+                window = {k: op[k] for k in time_window_fields if k in op}
+                if window:
+                    all_results.append(self.time_window_result_doc(op.get("task"), op.get("operation"), window))
 
         return all_results
 
@@ -2600,9 +2667,9 @@ class GlobalStatsCalculator:
                 t = task.name
                 op_type = task.operation.type
                 error_rate = self.error_rate(t, op_type, cluster_name=cluster_name)
-                duration = self.duration(t, cluster_name=cluster_name)
                 if task.operation.include_in_reporting or error_rate > 0:
                     self.logger.debug("Gathering request metrics for [%s].", t)
+                    time_window = self.time_window(t, cluster_name=cluster_name)
                     result.add_op_metrics(
                         t,
                         task.operation.name,
@@ -2611,8 +2678,9 @@ class GlobalStatsCalculator:
                         self.single_latency(t, op_type, metric_name="service_time", cluster_name=cluster_name),
                         self.single_latency(t, op_type, metric_name="processing_time", cluster_name=cluster_name),
                         error_rate,
-                        duration,
+                        self.duration(time_window),
                         self.merge(self.track.meta_data, self.challenge.meta_data, task.operation.meta_data, task.meta_data),
+                        time_window=time_window,
                     )
         self.logger.debug("Gathering indexing metrics.")
         result.total_time = self.sum("indexing_total_time")
@@ -2790,15 +2858,33 @@ class GlobalStatsCalculator:
             task=task_name, operation_type=operation_type, sample_type=SampleType.Normal, cluster_name=cluster_name
         )
 
-    def duration(self, task_name, cluster_name=None):
-        return self.store.get_one(
-            "service_time",
-            task=task_name,
-            cluster_name=cluster_name,
-            mapper=lambda doc: doc["relative-time"],
-            sort_key="relative-time",
-            sort_reverse=True,
-        )
+    def duration(self, time_window):
+        start = time_window.get("start_timestamp")
+        end = time_window.get("end_timestamp")
+        if start is None or end is None:
+            return None
+        return end - start
+
+    def time_window(self, task_name, cluster_name=None):
+        phases = {
+            "warmup": self.store.get_op_window(task_name, sample_type=SampleType.Warmup, cluster_name=cluster_name),
+            "normal": self.store.get_op_window(task_name, sample_type=SampleType.Normal, cluster_name=cluster_name),
+        }
+        window = {}
+        for phase, op_window in phases.items():
+            # a phase window is None when that phase produced no samples
+            if op_window:
+                window[f"{phase}_start_timestamp"] = int(op_window[0])
+                window[f"{phase}_end_timestamp"] = int(op_window[1])
+        starts = [op_window[0] for op_window in phases.values() if op_window]
+        ends = [op_window[1] for op_window in phases.values() if op_window]
+        if starts:
+            # start_timestamp is the earliest op start across phases (the first issued operation)
+            window["start_timestamp"] = int(min(starts))
+        if ends:
+            # end_timestamp is the timestamp of last response across phases (the last operation to complete)
+            window["end_timestamp"] = int(max(ends))
+        return window
 
     def median(self, metric_name, task_name=None, operation_type=None, sample_type=None, cluster_name=None):
         return self.store.get_median(
@@ -2966,7 +3052,19 @@ class GlobalStats:
     def v(self, d, k, default=None):
         return d.get(k, default) if isinstance(d, dict) else default
 
-    def add_op_metrics(self, task, operation, throughput, latency, service_time, processing_time, error_rate, duration, meta):
+    def add_op_metrics(
+        self,
+        task,
+        operation,
+        throughput,
+        latency,
+        service_time,
+        processing_time,
+        error_rate,
+        duration,
+        meta,
+        time_window,
+    ):
         doc = {
             "task": task,
             "operation": operation,
@@ -2977,6 +3075,8 @@ class GlobalStats:
             "error_rate": error_rate,
             "duration": duration,
         }
+        if time_window:
+            doc.update(time_window)
         if meta:
             doc["meta"] = meta
         self.op_metrics.append(doc)
